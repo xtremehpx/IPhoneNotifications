@@ -74,29 +74,30 @@ namespace IPhoneNotifications.AppleNotificationCenterService
             ValueChanged?.Invoke(dat);
         }
 
-        public async void UnsubscribeAsync()
+        public async Task<bool> UnsubscribeAsync()
         {
-            RemoveValueChangedHandler();
-
             try
             {
+                RemoveValueChangedHandler();
+
                 var result = await
                         GattCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
                             GattClientCharacteristicConfigurationDescriptorValue.None);
                 if (result != GattCommunicationStatus.Success)
                 {
                     System.Diagnostics.Debug.WriteLine("Error deregistering for notifications: {result}");
-                    // TODO: Error
-                    //rootPage.NotifyUser($"Error registering for notifications: {result}", NotifyType.ErrorMessage);
+                    return false;
                 }
             }
             catch (Exception e)
             {
                 System.Diagnostics.Debug.WriteLine(e.Message);
             }
+
+            return true;
         }
 
-        public async void SubscribeAsync()
+        public async Task<bool> SubscribeAsync()
         {
             if (GattCharacteristic.CharacteristicProperties.HasFlag(GattCharacteristicProperties.Notify))
             {
@@ -111,25 +112,30 @@ namespace IPhoneNotifications.AppleNotificationCenterService
                     if (result == GattCommunicationStatus.Success)
                     {
                         AddValueChangedHandler();
-                        //rootPage.NotifyUser("Successfully registered for notifications", NotifyType.StatusMessage);
                     }
                     else
                     {
-                        System.Diagnostics.Debug.WriteLine("Error registering for notifications: {result}");
-                        // TODO: Error
-                        //rootPage.NotifyUser($"Error registering for notifications: {result}", NotifyType.ErrorMessage);
+                        //throw new Exception($"Error registering for notifications: {result}");
+                        System.Diagnostics.Debug.WriteLine($"Error registering for notifications: {result}");
+                        return false;
                     }
                 }
                 catch (Exception e)
                 {
-                    RemoveValueChangedHandler();
-                    throw e;
-                }
+                    //RemoveValueChangedHandler();
+                    //throw e;
+                    System.Diagnostics.Debug.WriteLine("Notification source subscribe failed. " + e.Message);
+                    return false;
+                }                
             }
             else
             {
-                throw new Exception("Notification source characteristic does not have a notify property.");
+                System.Diagnostics.Debug.WriteLine("Notification source characteristic does not have a notify property.");
+                //throw new Exception("Notification source characteristic does not have a notify property.");
+                return false;                
             }
+
+            return true;
         }
 
         private NotificationSourceData ByteArrayToNotificationSourceData(byte[] packet)

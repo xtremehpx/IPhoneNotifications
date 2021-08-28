@@ -10,6 +10,7 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using Windows.Foundation;
 using Windows.ApplicationModel.Activation;
 using Microsoft.QueryStringDotNET;
+using Windows.Devices.Enumeration;
 
 namespace IPhoneNotifications.AppleNotificationCenterService
 {
@@ -29,14 +30,16 @@ namespace IPhoneNotifications.AppleNotificationCenterService
         private Dictionary<UInt32, NotificationSourceData> Notifications;
         private Dictionary<string, ApplicationAttributeCollection> Applications;
         private Dictionary<string, Queue<NotificationAttributeCollection>> ApplicationNotificationQueue;
-        
+
 
         public event TypedEventHandler<NotificationConsumer, AppleNotificationEventArgs> NotificationAdded;
         public event TypedEventHandler<NotificationConsumer, AppleNotificationEventArgs> NotificationModified;
         public event TypedEventHandler<NotificationConsumer, NotificationSourceData> NotificationRemoved;
 
         public static Action<IActivatedEventArgs> OnToastNotification = args => { };
-        
+
+        private bool subscribedForNotifications = false;
+
         public NotificationConsumer()
         {
             Applications = new Dictionary<string, ApplicationAttributeCollection>();
@@ -46,69 +49,121 @@ namespace IPhoneNotifications.AppleNotificationCenterService
             OnToastNotification = OnToastNotificationReceived;
         }
 
+
+        private static Guid ancsUuid = new Guid("7905F431-B5CE-4E99-A40F-4B1E122D00D0");
+        private static Guid notificationSourceUuid = new Guid("9FBF120D-6301-42D9-8C58-25E699A21DBD");
+        private static Guid controlPointUuid = new Guid("69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9");
+        private static Guid dataSourceUuid = new Guid("22EAC6E9-24D6-4BB5-BE44-B36ACE7C7BFB");
+
         public async void Connect()
         {
-            ClearBluetoothLEDevice();
+            if (!await ClearBluetoothLEDevice())
+            {
+                System.Diagnostics.Debug.WriteLine("Error: Unable to reset state, try again.");
+                //throw new Exception("Error: Unable to reset state, try again.");
+                return;
+            }
 
             try
             {
                 // BT_Code: BluetoothLEDevice.FromIdAsync must be called from a UI thread because it may prompt for consent.
                 bluetoothLeDevice = await BluetoothLEDevice.FromIdAsync(BluetoothLEDeviceId);
-                bluetoothLeDevice.ConnectionStatusChanged += BluetoothLeDevice_ConnectionStatusChanged;
+
+                if (bluetoothLeDevice == null)
+                {
+                    throw new Exception("Failed to connect to device.");
+                }
+                System.Diagnostics.Debug.WriteLine("Device connected is: " + bluetoothLeDevice.ConnectionStatus);
+
+                //bluetoothLeDevice.ConnectionStatusChanged += BluetoothLeDevice_ConnectionStatusChanged;
+
             }
             catch (Exception ex) when ((uint)ex.HResult == 0x800710df)
             {
                 // ERROR_DEVICE_NOT_AVAILABLE because the Bluetooth radio is not on.
+                throw new Exception("ERROR_DEVICE_NOT_AVAILABLE because the Bluetooth radio is not on.");
             }
 
             if (bluetoothLeDevice != null)
             {
-                Guid ancsUuid = new Guid("7905F431-B5CE-4E99-A40F-4B1E122D00D0");
-
                 try
                 {
-                    GattService = bluetoothLeDevice.GetGattService(ancsUuid);
+                    var ret = await bluetoothLeDevice.GetGattServicesForUuidAsync(ancsUuid);
+                    GattService = ret.Services[0];
+
+                    if (GattService == null)
+                    {
+                        throw new Exception("Apple Notification Center Service not found.");
+                    }
+
+                    var accessStatus = await GattService.RequestAccessAsync();
+                    if (accessStatus == DeviceAccessStatus.Allowed)
+                    {
+                        var rett = await GattService.GetCharacteristicsForUuidAsync(controlPointUuid);
+                        ControlPoint = new ControlPoint(rett.Characteristics[0]);
+
+                        rett = await GattService.GetCharacteristicsForUuidAsync(dataSourceUuid);
+                        DataSource = new DataSource(rett.Characteristics[0]);
+
+                        rett = await GattService.GetCharacteristicsForUuidAsync(notificationSourceUuid);
+                        NotificationSource = new NotificationSource(rett.Characteristics[0]);
+                    }
+                    else
+                    {
+                        throw new Exception("Access to ANCS is not granted: " + accessStatus.ToString());
+                    }
                 }
                 catch (Exception ex)
                 {
-                    throw new Exception("Apple Notification Center Service not found.");
+                    throw new Exception(ex.Message);
                 }
-                
 
-                if (GattService == null)
+                if (bluetoothLeDevice.ConnectionStatus == Windows.Devices.Bluetooth.BluetoothConnectionStatus.Connected)
                 {
-                    throw new Exception("Apple Notification Center Service not found.");
+                    if (DataSource != null && DataSource.GattCharacteristic.Service != null)
+                    {
+                        bool ret = await DataSource.SubscribeAsync();
+                        if (ret)
+                        {
+                            DataSource.ApplicationAttributesReceived += DataSource_ApplicationAttributesReceived;
+                            DataSource.NotificationAttributesReceived += DataSource_NotificationAttributesReceived;
+                        }
+                    }
+
+                    if (NotificationSource != null && NotificationSource.GattCharacteristic.Service != null)
+                    {
+                        bool ret = await NotificationSource.SubscribeAsync();
+                        if (ret)
+                        {
+
+                            NotificationSource.ValueChanged += NotificationSource_ValueChanged;
+                        }
+                    }
+
                 }
                 else
                 {
-                    Guid notificationSourceUuid = new Guid("9FBF120D-6301-42D9-8C58-25E699A21DBD");
-                    Guid controlPointUuid       = new Guid("69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9");
-                    Guid dataSourceUuid         = new Guid("22EAC6E9-24D6-4BB5-BE44-B36ACE7C7BFB");
-
-                    try
-                    {
-                        ControlPoint       = new ControlPoint(GattService.GetCharacteristics(controlPointUuid).First());
-                        DataSource         = new DataSource(GattService.GetCharacteristics(dataSourceUuid).First());
-                        NotificationSource = new NotificationSource(GattService.GetCharacteristics(notificationSourceUuid).First());
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new Exception(ex.Message);
-                    }
+                    DataSource.ApplicationAttributesReceived -= DataSource_ApplicationAttributesReceived;
+                    DataSource.NotificationAttributesReceived -= DataSource_NotificationAttributesReceived;
+                    NotificationSource.ValueChanged -= NotificationSource_ValueChanged;
+                    subscribedForNotifications = false;
                 }
             }
             else
             {
-                ClearBluetoothLEDevice();
                 throw new Exception("Failed to connect to device.");
             }
+
+            System.Diagnostics.Debug.WriteLine("Device connected is: " + bluetoothLeDevice.ConnectionStatus);
         }
 
-        private void ClearBluetoothLEDevice()
+        private async Task<bool> ClearBluetoothLEDevice()
         {
+            bool status = true;
+
             GattService?.Dispose();
             GattService = null;
-            
+
 
             if (ControlPoint != null)
             {
@@ -117,51 +172,76 @@ namespace IPhoneNotifications.AppleNotificationCenterService
 
             if (NotificationSource != null)
             {
+                status = await NotificationSource?.UnsubscribeAsync();
+
                 NotificationSource.ValueChanged -= NotificationSource_ValueChanged;
                 NotificationSource = null;
             }
 
             if (DataSource != null)
             {
+                status &= await DataSource?.UnsubscribeAsync();
+
                 DataSource.NotificationAttributesReceived -= DataSource_NotificationAttributesReceived;
                 DataSource = null;
             }
 
-            try
-            {
-                bluetoothLeDevice.ConnectionStatusChanged -= BluetoothLeDevice_ConnectionStatusChanged;
-            }
-            catch (Exception ex)
-            {
-                // Do nothing
-            }
-            
+            //if (bluetoothLeDevice != null)
+            //{
+            //    bluetoothLeDevice.ConnectionStatusChanged -= BluetoothLeDevice_ConnectionStatusChanged;
+            //}
+
             bluetoothLeDevice?.Dispose();
             bluetoothLeDevice = null;
+            subscribedForNotifications = false;
+
+            return status;
         }
-        
+
 
         private async void BluetoothLeDevice_ConnectionStatusChanged(BluetoothLEDevice sender, object args)
         {
             if (sender.ConnectionStatus == Windows.Devices.Bluetooth.BluetoothConnectionStatus.Connected)
             {
+
+                //var status = await GattService.RequestAccessAsync();
+                //if (status == DeviceAccessStatus.Allowed)
+                //{
+
+                //    var rett = await GattService.GetCharacteristicsForUuidAsync(dataSourceUuid);
+                //    DataSource = new DataSource(rett.Characteristics[0]);
+
+                //    rett = await GattService.GetCharacteristicsForUuidAsync(notificationSourceUuid);
+                //    NotificationSource = new NotificationSource(rett.Characteristics[0]);
+                //}
+
+
                 DataSource.ApplicationAttributesReceived += DataSource_ApplicationAttributesReceived;
                 DataSource.NotificationAttributesReceived += DataSource_NotificationAttributesReceived;
                 NotificationSource.ValueChanged += NotificationSource_ValueChanged;
 
+
+
                 try
                 {
-                    DataSource.SubscribeAsync();
-                    NotificationSource.SubscribeAsync();
+                    if (!subscribedForNotifications)
+                    {
+                        subscribedForNotifications = await NotificationSource.SubscribeAsync();
+                        subscribedForNotifications &= await DataSource.SubscribeAsync();
+                    }
                 }
                 catch (Exception e)
                 {
-                    NotificationSource.UnsubscribeAsync();
-                    DataSource.UnsubscribeAsync();
+                    if (subscribedForNotifications)
+                    {
+                        await NotificationSource.UnsubscribeAsync();
+                        await DataSource.UnsubscribeAsync();
+                    }
 
                     DataSource.ApplicationAttributesReceived -= DataSource_ApplicationAttributesReceived;
                     DataSource.NotificationAttributesReceived -= DataSource_NotificationAttributesReceived;
                     NotificationSource.ValueChanged -= NotificationSource_ValueChanged;
+                    subscribedForNotifications = false;
                 }
             }
             else
@@ -169,6 +249,7 @@ namespace IPhoneNotifications.AppleNotificationCenterService
                 DataSource.ApplicationAttributesReceived -= DataSource_ApplicationAttributesReceived;
                 DataSource.NotificationAttributesReceived -= DataSource_NotificationAttributesReceived;
                 NotificationSource.ValueChanged -= NotificationSource_ValueChanged;
+                subscribedForNotifications = false;
             }
         }
 
@@ -324,13 +405,13 @@ namespace IPhoneNotifications.AppleNotificationCenterService
             {
                 Notifications.Add(obj.NotificationUID, obj);
             }
-            
+
             // Build the attributes list for the GetNotificationAttributtes command.   
             List<NotificationAttributeID> attributes = new List<NotificationAttributeID>();
             attributes.Add(NotificationAttributeID.AppIdentifier);
             attributes.Add(NotificationAttributeID.Title);
             attributes.Add(NotificationAttributeID.Message);
-            
+
             if (obj.EventFlags.HasFlag(EventFlags.EventFlagPositiveAction))
             {
                 attributes.Add(NotificationAttributeID.PositiveActionLabel);
